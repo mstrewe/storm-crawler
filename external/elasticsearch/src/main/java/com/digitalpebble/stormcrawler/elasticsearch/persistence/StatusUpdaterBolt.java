@@ -59,312 +59,296 @@ import com.google.common.cache.RemovalNotification;
  * Spout to read from the index.
  **/
 @SuppressWarnings("serial")
-public class StatusUpdaterBolt extends AbstractStatusUpdaterBolt implements
-        RemovalListener<String, List<Tuple>>, BulkProcessor.Listener {
+public class StatusUpdaterBolt extends AbstractStatusUpdaterBolt
+		implements RemovalListener<String, List<Tuple>>, BulkProcessor.Listener {
 
-    private static final Logger LOG = LoggerFactory
-            .getLogger(StatusUpdaterBolt.class);
+	private static final Logger LOG = LoggerFactory.getLogger(StatusUpdaterBolt.class);
 
-    private String ESBoltType = "status";
+	private String ESBoltType = "status";
 
-    private static final String ESStatusIndexNameParamName = "es.%s.index.name";
-    private static final String ESStatusRoutingParamName = "es.%s.routing";
-    private static final String ESStatusRoutingFieldParamName = "es.%s.routing.fieldname";
+	private static final String ESStatusIndexNameParamName = "es.%s.index.name";
+	private static final String ESStatusRoutingParamName = "es.%s.routing";
+	private static final String ESStatusRoutingFieldParamName = "es.%s.routing.fieldname";
 
-    private boolean routingFieldNameInMetadata = false;
+	private boolean routingFieldNameInMetadata = false;
 
-    private String indexName;
+	private String indexName;
 
-    private URLPartitioner partitioner;
+	private URLPartitioner partitioner;
 
-    /**
-     * whether to apply the same partitioning logic used for politeness for
-     * routing, e.g byHost
-     **/
-    private boolean doRouting;
+	/**
+	 * whether to apply the same partitioning logic used for politeness for routing,
+	 * e.g byHost
+	 **/
+	private boolean doRouting;
 
-    /** Store the key used for routing explicitly as a field in metadata **/
-    private String fieldNameForRoutingKey = null;
+	/** Store the key used for routing explicitly as a field in metadata **/
+	private String fieldNameForRoutingKey = null;
 
-    private ElasticSearchConnection connection;
+	private ElasticSearchConnection connection;
 
-    private Cache<String, List<Tuple>> waitAck;
+	private Cache<String, List<Tuple>> waitAck;
 
-    private MultiCountMetric eventCounter;
+	private MultiCountMetric eventCounter;
 
-    public StatusUpdaterBolt() {
-        super();
-    }
+	public StatusUpdaterBolt() {
+		super();
+	}
 
-    /**
-     * Loads the configuration using a substring different from the default
-     * value 'status' in order to distinguish it from the spout configurations
-     **/
-    public StatusUpdaterBolt(String boltType) {
-        super();
-        ESBoltType = boltType;
-    }
+	/**
+	 * Loads the configuration using a substring different from the default value
+	 * 'status' in order to distinguish it from the spout configurations
+	 **/
+	public StatusUpdaterBolt(String boltType) {
+		super();
+		ESBoltType = boltType;
+	}
 
-    @Override
-    public void prepare(Map stormConf, TopologyContext context,
-            OutputCollector collector) {
+	@Override
+	public void prepare(Map stormConf, TopologyContext context, OutputCollector collector) {
 
-        super.prepare(stormConf, context, collector);
+		super.prepare(stormConf, context, collector);
 
-        indexName = ConfUtils.getString(stormConf,
-                String.format(StatusUpdaterBolt.ESStatusIndexNameParamName,
-                        ESBoltType),
-                "status");
+		indexName = ConfUtils.getString(stormConf,
+				String.format(StatusUpdaterBolt.ESStatusIndexNameParamName, ESBoltType), "status");
 
-        doRouting = ConfUtils.getBoolean(stormConf, String.format(
-                StatusUpdaterBolt.ESStatusRoutingParamName, ESBoltType), false);
+		doRouting = ConfUtils.getBoolean(stormConf,
+				String.format(StatusUpdaterBolt.ESStatusRoutingParamName, ESBoltType), false);
 
-        partitioner = new URLPartitioner();
-        partitioner.configure(stormConf);
+		partitioner = new URLPartitioner();
+		partitioner.configure(stormConf);
 
-        fieldNameForRoutingKey = ConfUtils.getString(stormConf, String.format(
-                StatusUpdaterBolt.ESStatusRoutingFieldParamName, ESBoltType));
-        if (StringUtils.isNotBlank(fieldNameForRoutingKey)) {
-            if (fieldNameForRoutingKey.startsWith("metadata.")) {
-                routingFieldNameInMetadata = true;
-                fieldNameForRoutingKey = fieldNameForRoutingKey
-                        .substring("metadata.".length());
-            }
-            // periods are not allowed in ES2 - replace with %2E
-            fieldNameForRoutingKey = fieldNameForRoutingKey.replaceAll("\\.",
-                    "%2E");
-        }
+		fieldNameForRoutingKey = ConfUtils.getString(stormConf,
+				String.format(StatusUpdaterBolt.ESStatusRoutingFieldParamName, ESBoltType));
+		if (StringUtils.isNotBlank(fieldNameForRoutingKey)) {
+			if (fieldNameForRoutingKey.startsWith("metadata.")) {
+				routingFieldNameInMetadata = true;
+				fieldNameForRoutingKey = fieldNameForRoutingKey.substring("metadata.".length());
+			}
+			// periods are not allowed in ES2 - replace with %2E
+			fieldNameForRoutingKey = fieldNameForRoutingKey.replaceAll("\\.", "%2E");
+		}
 
-        waitAck = CacheBuilder.newBuilder()
-                .expireAfterWrite(60, TimeUnit.SECONDS).removalListener(this)
-                .build();
+		waitAck = CacheBuilder.newBuilder().expireAfterWrite(60, TimeUnit.SECONDS).removalListener(this).build();
 
-        // create gauge for waitAck
-        context.registerMetric("waitAck", () -> {
-            return waitAck.size();
-        }, 10);
+		// create gauge for waitAck
+		context.registerMetric("waitAck", () -> {
+			return waitAck.size();
+		}, 10);
 
-        try {
-            connection = ElasticSearchConnection.getConnection(stormConf,
-                    ESBoltType, this);
-        } catch (Exception e1) {
-            LOG.error("Can't connect to ElasticSearch", e1);
-            throw new RuntimeException(e1);
-        }
+		try {
+			connection = ElasticSearchConnection.getConnection(stormConf, ESBoltType, this);
+		} catch (Exception e1) {
+			LOG.error("Can't connect to ElasticSearch", e1);
+			throw new RuntimeException(e1);
+		}
 
-        this.eventCounter = context.registerMetric("counters",
-                new MultiCountMetric(), 30);
-    }
+		this.eventCounter = context.registerMetric("counters", new MultiCountMetric(), 30);
+	}
 
-    @Override
-    public void cleanup() {
-        if (connection != null)
-            connection.close();
-    }
+	@Override
+	public void cleanup() {
+		if (connection != null)
+			connection.close();
+	}
 
-    @Override
-    public void store(String url, Status status, Metadata metadata,
-            Date nextFetch, Tuple tuple) throws Exception {
+	@Override
+	public void store(String url, Status status, Metadata metadata, Date nextFetch, Tuple tuple) throws Exception {
 
-        String sha256hex = org.apache.commons.codec.digest.DigestUtils
-                .sha256Hex(url);
+		String sha256hex = org.apache.commons.codec.digest.DigestUtils.sha256Hex(url);
 
-        // need to synchronize: otherwise it might get added to the cache
-        // without having been sent to ES
-        synchronized (waitAck) {
-            // check that the same URL is not being sent to ES
-            List<Tuple> alreadySent = waitAck.getIfPresent(sha256hex);
-            if (alreadySent != null && status.equals(Status.DISCOVERED)) {
-                // if this object is discovered - adding another version of it
-                // won't make any difference
-                LOG.debug(
-                        "Already being sent to ES {} with status {} and ID {}",
-                        url, status, sha256hex);
-                // ack straight away!
-                super.ack(tuple, url);
-                return;
-            }
-        }
+		// need to synchronize: otherwise it might get added to the cache
+		// without having been sent to ES
+		synchronized (waitAck) {
+			// check that the same URL is not being sent to ES
+			List<Tuple> alreadySent = waitAck.getIfPresent(sha256hex);
+			if (alreadySent != null && status.equals(Status.DISCOVERED)) {
+				// if this object is discovered - adding another version of it
+				// won't make any difference
+				LOG.debug("Already being sent to ES {} with status {} and ID {}", url, status, sha256hex);
+				// ack straight away!
+				super.ack(tuple, url);
+				return;
+			}
+		}
 
-        XContentBuilder builder = jsonBuilder().startObject();
-        builder.field("url", url);
-        builder.field("status", status);
+		XContentBuilder builder = jsonBuilder().startObject();
+		builder.field("url", url);
+		builder.field("status", status);
 
-        // check that we don't overwrite an existing entry
-        // When create is used, the index operation will fail if a document
-        // by that id already exists in the index.
-        boolean create = status.equals(Status.DISCOVERED);
+		// check that we don't overwrite an existing entry
+		// When create is used, the index operation will fail if a document
+		// by that id already exists in the index.
+		boolean create = status.equals(Status.DISCOVERED);
 
-        builder.startObject("metadata");
-        Iterator<String> mdKeys = metadata.keySet().iterator();
-        while (mdKeys.hasNext()) {
-            String mdKey = mdKeys.next();
-            String[] values = metadata.getValues(mdKey);
-            // periods are not allowed in ES2 - replace with %2E
-            mdKey = mdKey.replaceAll("\\.", "%2E");
-            builder.array(mdKey, values);
-        }
+		// store top level domain to metadata
+		if (metadata.asMap().containsKey("tld") == false) {
+			String domain = url.split("/")[2];
+			String[] domainSplit = domain.split("\\.");
+			if (domainSplit.length >= 2) {
+				String tld = domainSplit[domainSplit.length - 1];
+				metadata.addValue("tld", tld);
+			}
+		}
 
-        String partitionKey = partitioner.getPartition(url, metadata);
-        if (partitionKey == null) {
-            partitionKey = "_DEFAULT_";
-        }
+		builder.startObject("metadata");
+		Iterator<String> mdKeys = metadata.keySet().iterator();
+		while (mdKeys.hasNext()) {
+			String mdKey = mdKeys.next();
+			String[] values = metadata.getValues(mdKey);
+			// periods are not allowed in ES2 - replace with %2E
+			mdKey = mdKey.replaceAll("\\.", "%2E");
+			builder.array(mdKey, values);
+		}
 
-        // store routing key in metadata?
-        if (StringUtils.isNotBlank(fieldNameForRoutingKey)
-                && routingFieldNameInMetadata) {
-            builder.field(fieldNameForRoutingKey, partitionKey);
-        }
+		String partitionKey = partitioner.getPartition(url, metadata);
+		if (partitionKey == null) {
+			partitionKey = "_DEFAULT_";
+		}
 
-        builder.endObject();
+		// store routing key in metadata?
+		if (StringUtils.isNotBlank(fieldNameForRoutingKey) && routingFieldNameInMetadata) {
+			builder.field(fieldNameForRoutingKey, partitionKey);
+		}
 
-        // store routing key outside metadata?
-        if (StringUtils.isNotBlank(fieldNameForRoutingKey)
-                && !routingFieldNameInMetadata) {
-            builder.field(fieldNameForRoutingKey, partitionKey);
-        }
+		builder.endObject();
 
-        builder.field("nextFetchDate", nextFetch);
+		// store routing key outside metadata?
+		if (StringUtils.isNotBlank(fieldNameForRoutingKey) && !routingFieldNameInMetadata) {
+			builder.field(fieldNameForRoutingKey, partitionKey);
+		}
 
-        builder.endObject();
+		builder.field("nextFetchDate", nextFetch);
 
-        IndexRequest request = new IndexRequest(getIndexName(metadata));
-        request.source(builder).id(sha256hex).create(create);
+		builder.endObject();
 
-        if (doRouting) {
-            request.routing(partitionKey);
-        }
+		IndexRequest request = new IndexRequest(getIndexName(metadata));
+		request.source(builder).id(sha256hex).create(create);
 
-        synchronized (waitAck) {
-            List<Tuple> tt = waitAck.getIfPresent(sha256hex);
-            if (tt == null) {
-                tt = new LinkedList<>();
-                waitAck.put(sha256hex, tt);
-            }
-            tt.add(tuple);
-            LOG.debug("Added to waitAck {} with ID {} total {}", url,
-                    sha256hex, tt.size());
-        }
+		if (doRouting) {
+			request.routing(partitionKey);
+		}
 
-        LOG.debug("Sending to ES buffer {} with ID {}", url, sha256hex);
+		synchronized (waitAck) {
+			List<Tuple> tt = waitAck.getIfPresent(sha256hex);
+			if (tt == null) {
+				tt = new LinkedList<>();
+				waitAck.put(sha256hex, tt);
+			}
+			tt.add(tuple);
+			LOG.debug("Added to waitAck {} with ID {} total {}", url, sha256hex, tt.size());
+		}
 
-        connection.getProcessor().add(request);
-    }
+		LOG.debug("Sending to ES buffer {} with ID {}", url, sha256hex);
 
-    public void onRemoval(RemovalNotification<String, List<Tuple>> removal) {
-        if (!removal.wasEvicted())
-            return;
-        LOG.error("Purged from waitAck {} with {} values", removal.getKey(),
-                removal.getValue().size());
-        for (Tuple t : removal.getValue()) {
-            _collector.fail(t);
-        }
-    }
+		connection.getProcessor().add(request);
+	}
 
-    @Override
-    public void afterBulk(long executionId, BulkRequest request,
-            BulkResponse response) {
-        LOG.debug("afterBulk [{}] with {} responses", executionId,
-                request.numberOfActions());
-        long msec = response.getTook().getMillis();
-        eventCounter.scope("bulks_received").incrBy(1);
-        eventCounter.scope("bulk_msec").incrBy(msec);
-        Iterator<BulkItemResponse> bulkitemiterator = response.iterator();
-        int itemcount = 0;
-        int acked = 0;
-        int failurecount = 0;
+	public void onRemoval(RemovalNotification<String, List<Tuple>> removal) {
+		if (!removal.wasEvicted())
+			return;
+		LOG.error("Purged from waitAck {} with {} values", removal.getKey(), removal.getValue().size());
+		for (Tuple t : removal.getValue()) {
+			_collector.fail(t);
+		}
+	}
 
-        synchronized (waitAck) {
-            while (bulkitemiterator.hasNext()) {
-                BulkItemResponse bir = bulkitemiterator.next();
-                itemcount++;
-                String id = bir.getId();
-                BulkItemResponse.Failure f = bir.getFailure();
-                boolean failed = false;
-                if (f != null) {
-                    // already discovered
-                    if (f.getStatus().equals(RestStatus.CONFLICT)) {
-                        eventCounter.scope("doc_conflicts").incrBy(1);
-                        LOG.debug("Doc conflict ID {}", id);
-                    } else {
-                        LOG.error("Update ID {}, failure: {}", id, f);
-                        failed = true;
-                    }
-                }
-                List<Tuple> xx = waitAck.getIfPresent(id);
-                if (xx != null) {
-                    LOG.debug("Acked {} tuple(s) for ID {}", xx.size(), id);
-                    for (Tuple x : xx) {
-                        if (!failed) {
-                            String url = x.getStringByField("url");
-                            acked++;
-                            // ack and put in cache
-                            LOG.debug("Acked {} with ID {}", url, id);
-                            super.ack(x, url);
-                        } else {
-                            failurecount++;
-                            _collector.fail(x);
-                        }
-                    }
-                    waitAck.invalidate(id);
-                } else {
-                    LOG.warn("Could not find unacked tuple for {}", id);
-                }
-            }
+	@Override
+	public void afterBulk(long executionId, BulkRequest request, BulkResponse response) {
+		LOG.debug("afterBulk [{}] with {} responses", executionId, request.numberOfActions());
+		long msec = response.getTook().getMillis();
+		eventCounter.scope("bulks_received").incrBy(1);
+		eventCounter.scope("bulk_msec").incrBy(msec);
+		Iterator<BulkItemResponse> bulkitemiterator = response.iterator();
+		int itemcount = 0;
+		int acked = 0;
+		int failurecount = 0;
 
-            LOG.info(
-                    "Bulk response [{}] : items {}, waitAck {}, acked {}, failed {}",
-                    executionId, itemcount, waitAck.size(), acked, failurecount);
-            if (waitAck.size() > 0 && LOG.isDebugEnabled()) {
-                for (String kinaw : waitAck.asMap().keySet()) {
-                    LOG.debug(
-                            "Still in wait ack after bulk response [{}] => {}",
-                            executionId, kinaw);
-                }
-            }
-        }
-    }
+		synchronized (waitAck) {
+			while (bulkitemiterator.hasNext()) {
+				BulkItemResponse bir = bulkitemiterator.next();
+				itemcount++;
+				String id = bir.getId();
+				BulkItemResponse.Failure f = bir.getFailure();
+				boolean failed = false;
+				if (f != null) {
+					// already discovered
+					if (f.getStatus().equals(RestStatus.CONFLICT)) {
+						eventCounter.scope("doc_conflicts").incrBy(1);
+						LOG.debug("Doc conflict ID {}", id);
+					} else {
+						LOG.error("Update ID {}, failure: {}", id, f);
+						failed = true;
+					}
+				}
+				List<Tuple> xx = waitAck.getIfPresent(id);
+				if (xx != null) {
+					LOG.debug("Acked {} tuple(s) for ID {}", xx.size(), id);
+					for (Tuple x : xx) {
+						if (!failed) {
+							String url = x.getStringByField("url");
+							acked++;
+							// ack and put in cache
+							LOG.debug("Acked {} with ID {}", url, id);
+							super.ack(x, url);
+						} else {
+							failurecount++;
+							_collector.fail(x);
+						}
+					}
+					waitAck.invalidate(id);
+				} else {
+					LOG.warn("Could not find unacked tuple for {}", id);
+				}
+			}
 
-    @Override
-    public void afterBulk(long executionId, BulkRequest request,
-            Throwable throwable) {
-        eventCounter.scope("bulks_received").incrBy(1);
-        LOG.error("Exception with bulk {} - failing the whole lot ",
-                executionId, throwable);
-        synchronized (waitAck) {
-            // WHOLE BULK FAILED
-            // mark all the docs as fail
-            Iterator<DocWriteRequest<?>> itreq = request.requests().iterator();
-            while (itreq.hasNext()) {
-                DocWriteRequest bir = itreq.next();
-                String id = bir.id();
-                List<Tuple> xx = waitAck.getIfPresent(id);
-                if (xx != null) {
-                    LOG.debug("Failed {} tuple(s) for ID {}", xx.size(), id);
-                    for (Tuple x : xx) {
-                        // fail it
-                        _collector.fail(x);
-                    }
-                    waitAck.invalidate(id);
-                } else {
-                    LOG.warn("Could not find unacked tuple for {}", id);
-                }
-            }
-        }
-    }
+			LOG.info("Bulk response [{}] : items {}, waitAck {}, acked {}, failed {}", executionId, itemcount,
+					waitAck.size(), acked, failurecount);
+			if (waitAck.size() > 0 && LOG.isDebugEnabled()) {
+				for (String kinaw : waitAck.asMap().keySet()) {
+					LOG.debug("Still in wait ack after bulk response [{}] => {}", executionId, kinaw);
+				}
+			}
+		}
+	}
 
-    @Override
-    public void beforeBulk(long executionId, BulkRequest request) {
-        LOG.debug("beforeBulk {} with {} actions", executionId,
-                request.numberOfActions());
-        eventCounter.scope("bulks_received").incrBy(1);
-    }
+	@Override
+	public void afterBulk(long executionId, BulkRequest request, Throwable throwable) {
+		eventCounter.scope("bulks_received").incrBy(1);
+		LOG.error("Exception with bulk {} - failing the whole lot ", executionId, throwable);
+		synchronized (waitAck) {
+			// WHOLE BULK FAILED
+			// mark all the docs as fail
+			Iterator<DocWriteRequest<?>> itreq = request.requests().iterator();
+			while (itreq.hasNext()) {
+				DocWriteRequest bir = itreq.next();
+				String id = bir.id();
+				List<Tuple> xx = waitAck.getIfPresent(id);
+				if (xx != null) {
+					LOG.debug("Failed {} tuple(s) for ID {}", xx.size(), id);
+					for (Tuple x : xx) {
+						// fail it
+						_collector.fail(x);
+					}
+					waitAck.invalidate(id);
+				} else {
+					LOG.warn("Could not find unacked tuple for {}", id);
+				}
+			}
+		}
+	}
 
-    /**
-     * Must be overridden for implementing custom index names based on some
-     * metadata information By Default, indexName coming from config is used
-     */
-    protected String getIndexName(Metadata m) {
-        return indexName;
-    }
+	@Override
+	public void beforeBulk(long executionId, BulkRequest request) {
+		LOG.debug("beforeBulk {} with {} actions", executionId, request.numberOfActions());
+		eventCounter.scope("bulks_received").incrBy(1);
+	}
+
+	/**
+	 * Must be overridden for implementing custom index names based on some metadata
+	 * information By Default, indexName coming from config is used
+	 */
+	protected String getIndexName(Metadata m) {
+		return indexName;
+	}
 }
